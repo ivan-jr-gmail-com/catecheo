@@ -1,0 +1,116 @@
+# Catecheo CI/CD (D-061, design-environments §5-6)
+#
+#   push to preview     -> checks -> deploy-preview    (catecheo-preview DB, *.preview.catecheo.com)
+#   PR preview -> main  -> checks                      (required before merging)
+#   push to main        -> checks -> deploy-production (waits for approval on the "production" environment)
+#
+# Secrets (per GitHub environment "preview" / "production"):
+#   DATABASE_MIGRATION_URL  owner connection (Supabase session pooler); never stored in Vercel
+#   VERCEL_TOKEN            Vercel deploy token
+# Variables (repository):
+#   VERCEL_ORG_ID, VERCEL_PROJECT_ID
+
+name: CI
+
+on:
+  push:
+    branches: [preview, main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: "24"
+  GITLEAKS_VERSION: "8.30.1"
+  VERCEL_CLI: "vercel@65.14.0"
+  VERCEL_TELEMETRY_DISABLED: "1"
+
+jobs:
+  checks:
+    name: Checks
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: checks-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # full history for the secret scan
+
+      - name: Secret scan (gitleaks)
+        run: |
+          set -euo pipefail
+          asset="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          curl -fsSL -o "$asset" "$base/$asset"
+          curl -fsSL -o checksums.txt "$base/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          grep " ${asset}\$" checksums.txt | sha256sum -c -
+          tar -xzf "$asset" gitleaks
+          ./gitleaks git --redact --verbose --exit-code 1 .
+          rm -f gitleaks "$asset" checksums.txt
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm run build
+
+  deploy-preview:
+    name: Deploy Preview
+    needs: checks
+    if: github.event_name == 'push' && github.ref == 'refs/heads/preview'
+    runs-on: ubuntu-24.04
+    environment:
+      name: preview
+      url: https://app.preview.catecheo.com
+    concurrency:
+      group: deploy-preview
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Phase 0: no migrations yet. Prove the secret and the network path to the database.
+      # Phase 1 replaces this with the real migrate command (it must run before the deploy).
+      - name: Database check (migrations start in Phase 1)
+        env:
+          DATABASE_MIGRATION_URL: ${{ secrets.DATABASE_MIGRATION_URL }}
+        run: psql "$DATABASE_MIGRATION_URL" -v ON_ERROR_STOP=1 -tA -c "select current_user || ' @ ' || current_setting('server_version');"
+
+      - name: Deploy to Vercel (Preview)
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ vars.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
+        run: npx --yes "$VERCEL_CLI" deploy --yes
+
+  deploy-production:
+    name: Deploy Production
+    needs: checks
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment:
+      name: production # required reviewer: Ivan
+      url: https://catecheo.vercel.app
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Database check (migrations start in Phase 1)
+        env:
+          DATABASE_MIGRATION_URL: ${{ secrets.DATABASE_MIGRATION_URL }}
+        run: psql "$DATABASE_MIGRATION_URL" -v ON_ERROR_STOP=1 -tA -c "select current_user || ' @ ' || current_setting('server_version');"
+
+      - name: Deploy to Vercel (Production)
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ vars.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
+        run: npx --yes "$VERCEL_CLI" deploy --prod --yes
